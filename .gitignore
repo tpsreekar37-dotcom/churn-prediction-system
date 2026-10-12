@@ -1,0 +1,44 @@
+# Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Sensitive Information & Credentials
+.streamlit/secrets.toml
+.env
+*.env
+*.key
+*.pem
+credentials.json
+
+# Backup files
+*.bak
+*.swp
+*.swo
+
+# Redundant / Temporary Sub-projects
+customerpulse-ai/
+churn_predicting/
+
+# Archives & Large Export Documents
+*.zip
+*.tar.gz
+*.rar
+*.7z
+
+# Slide & Presentation Binaries (Large Files)
+*.pptx
+*.ppt
+*.docx
+slide_exports/
+
+# OS specific files
+.DS_Store
+Thumbs.db

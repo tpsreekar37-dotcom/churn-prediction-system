@@ -1,0 +1,7 @@
+{
+  "monthly_charge_threshold": 89.9,
+  "monthly_charge_min": 19.2,
+  "monthly_charge_max": 114.74000000000001,
+  "tenure_min": 0.0,
+  "tenure_max": 72.0
+}
