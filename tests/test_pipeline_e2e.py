@@ -13,6 +13,7 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from src.predict import predict_single, predict_batch, load_model
 from src.generic_pipeline import run_generic_pipeline, predict_generic_batch
 from src.sql_integration import store_predictions_to_sqlite, run_analytics, get_latest_run_id
@@ -62,15 +63,24 @@ def test_generic_pipeline_flow():
     assert len(pred_df) == len(df_raw)
 
 def test_sql_storage_and_telemetry():
-    df_raw = pd.read_csv(os.path.join("data", "sample_test_customers.csv"))
+    # Use a scratch database: writing to data/churn.db would pollute the live
+    # dashboard's run history every time the test suite runs.
+    db_path = os.path.join(PROJECT_ROOT, "data", "test_churn.db")
+    if os.path.exists(db_path):
+        os.remove(db_path)
+
+    df_raw = pd.read_csv(os.path.join(PROJECT_ROOT, "data", "sample_test_customers.csv"))
     pipeline_result = run_generic_pipeline(df_raw, "Churn", "customerID")
     pred_df = predict_generic_batch(df_raw, pipeline_result, "Churn", "customerID")
 
-    db_path, run_id = store_predictions_to_sqlite(pred_df)
-    assert os.path.exists(db_path)
+    returned_path, run_id = store_predictions_to_sqlite(pred_df, db_path=db_path)
+    assert returned_path == db_path
+    assert os.path.exists(returned_path)
     assert run_id is not None
 
-    analytics = run_analytics(run_id=run_id)
+    analytics = run_analytics(db_path=db_path, run_id=run_id)
     assert "revenue_at_risk" in analytics
     assert "churn_by_contract" in analytics
     assert "high_risk_customers" in analytics
+
+    os.remove(db_path)

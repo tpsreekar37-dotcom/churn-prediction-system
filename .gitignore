@@ -1,44 +1,34 @@
-# Virtual Environments
-venv/
-env/
-.venv/
-ENV/
-
-# Python Bytecode & Cache
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-
-# Sensitive Information & Credentials
+# ── Secrets ───────────────────────────────────────────────────────────────────
 .streamlit/secrets.toml
 .env
-*.env
-*.key
-*.pem
-credentials.json
 
-# Backup files
-*.bak
-*.swp
-*.swo
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
 
-# Redundant / Temporary Sub-projects
-customerpulse-ai/
-churn_predicting/
+# ── Generated database & runtime artifacts ────────────────────────────────────
+data/*.db
+data/*.db-wal
+data/*.db-shm
 
-# Archives & Large Export Documents
-*.zip
-*.tar.gz
-*.rar
-*.7z
+# ── Trained model binaries ────────────────────────────────────────────────────
+# These ARE committed on purpose. The deployed app loads models/best_model.pkl at
+# startup and does not retrain on the server, so the repo must contain them.
+# They can be regenerated at any time with `python main.py`.
+# (models/best_model.pkl is ~80 MB — under GitHub's 100 MB per-file limit.)
 
-# Slide & Presentation Binaries (Large Files)
-*.pptx
-*.ppt
-*.docx
-slide_exports/
-
-# OS specific files
+# ── Editor / OS noise ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+*.bak
+*.tmp
+
+# ── Local scratch / archived deliverables ─────────────────────────────────────
+_archive/

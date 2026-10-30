@@ -11,7 +11,7 @@ Steps:
   4. Scale numeric features
   5. Apply SMOTE if class imbalance exists
   6. Train Random Forest and XGBoost
-  7. Use Random Forest as the production model; retain XGBoost as a benchmark
+  7. Save the model with the highest holdout ROC-AUC as the production model
   8. Return predictions + feature importances + metrics
 
 Usage:
@@ -33,6 +33,11 @@ from sklearn.metrics import (
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 import joblib
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from src.utils import classify_risk_emoji, DECISION_THRESHOLD
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -89,7 +94,7 @@ def detect_column_types(df: pd.DataFrame, target_col: str, id_col: str = None):
                 col_types[col] = "binary"
             else:
                 col_types[col] = "numeric"
-        elif dtype == object or pd.api.types.is_categorical_dtype(dtype):
+        elif dtype == object or isinstance(dtype, pd.CategoricalDtype):
             if n_unique <= 2:
                 col_types[col] = "binary"
             elif n_unique > 50:
@@ -155,9 +160,14 @@ def preprocess_generic(df: pd.DataFrame, target_col: str,
     """
     Full preprocessing pipeline for any dataset.
 
+    The train/test split happens **before** any fitted transformation (imputation
+    values, label encoders, date reference dates, scaler). Every constant is
+    learned on the training partition and applied unchanged to the test partition,
+    so holdout metrics are not inflated by leakage.
+
     Returns:
         X_train, X_test, y_train, y_test, scaler, encoders, col_types,
-        feature_names, scaler_columns
+        feature_names, scaler_columns, date_refs, impute_values
     """
     df = df.copy()
 
@@ -165,88 +175,142 @@ def preprocess_generic(df: pd.DataFrame, target_col: str,
     df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=[target_col])
 
-    # ── Normalize target
-    df[target_col] = normalize_target(df[target_col])
-
-    # ── Detect column types
+    # ── Detect column types (dtype-based only — does not look at labels)
     col_types = detect_column_types(df, target_col, id_col)
 
-    # ── Drop high-cardinality / ID columns
+    # ── Drop high-cardinality / ID / leakage columns
     drop_cols = [c for c, t in col_types.items() if t == "drop"]
     df.drop(columns=drop_cols, inplace=True, errors="ignore")
 
-    # ── Parse date columns → days-since-min feature
-    date_cols = [c for c, t in col_types.items() if t == "date"]
+    # ── Normalize target
+    df[target_col] = normalize_target(df[target_col])
+    y_all = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
+
+    # ── SPLIT FIRST: everything below is fitted on train_df only
+    try:
+        train_idx, test_idx = train_test_split(
+            df.index, test_size=0.20, random_state=42, stratify=y_all
+        )
+    except ValueError:
+        # A class can be too rare to stratify; fall back to a plain split.
+        train_idx, test_idx = train_test_split(
+            df.index, test_size=0.20, random_state=42
+        )
+
+    train_df = df.loc[train_idx].copy()
+    test_df  = df.loc[test_idx].copy()
+
+    # ── Parse date columns → days-since-reference feature.
+    # The reference date is the training minimum, so the same calendar day maps
+    # to the same integer in train, test and at inference.
+    date_cols = [c for c, t in col_types.items() if t == "date" and c in df.columns]
+    date_refs = {}
     for col in date_cols:
-        if col not in df.columns:
-            continue
         try:
-            parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
-            ref = parsed.min()
-            df[col + "_days"] = (parsed - ref).dt.days.fillna(0).astype(int)
-            df.drop(columns=[col], inplace=True)
+            ref = pd.to_datetime(train_df[col], errors="coerce").min()
+            if pd.isna(ref):
+                raise ValueError("no parseable dates in training partition")
+            date_refs[col] = ref
+            for frame in (train_df, test_df):
+                parsed = pd.to_datetime(frame[col], errors="coerce")
+                frame[col + "_days"] = (parsed - ref).dt.days.fillna(0).astype(int)
+                frame.drop(columns=[col], inplace=True)
             col_types[col + "_days"] = "numeric"
         except Exception:
-            df.drop(columns=[col], inplace=True)
+            train_df.drop(columns=[col], inplace=True, errors="ignore")
+            test_df.drop(columns=[col], inplace=True, errors="ignore")
 
-    # ── Impute missing values
-    for col in df.columns:
-        if col == target_col:
-            continue
+    feature_cols = [c for c in train_df.columns if c != target_col]
+
+    # ── Imputation parameters (learned on train only)
+    impute_values = {}
+    for col in feature_cols:
         ctype = col_types.get(col, "numeric")
-        if df[col].isna().sum() > 0:
-            if ctype in ("numeric",):
-                df[col] = df[col].fillna(df[col].median())
-            else:
-                df[col] = df[col].fillna(df[col].mode().iloc[0] if not df[col].mode().empty else 0)
+        if ctype == "numeric":
+            val = pd.to_numeric(train_df[col], errors="coerce").median()
+            impute_values[col] = 0.0 if pd.isna(val) else float(val)
+        else:
+            mode = train_df[col].mode()
+            impute_values[col] = mode.iloc[0] if not mode.empty else 0
 
-    # ── Encode binary columns (2 unique values)
+    def _impute(frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.copy()
+        for col in feature_cols:
+            if col not in frame.columns:
+                continue
+            ctype = col_types.get(col, "numeric")
+            if ctype == "numeric":
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").replace(
+                    [np.inf, -np.inf], np.nan
+                ).fillna(impute_values[col])
+            else:
+                frame[col] = frame[col].fillna(impute_values[col])
+        return frame
+
+    train_df = _impute(train_df)
+    test_df  = _impute(test_df)
+
+    # ── Encoders (fit on train only)
     encoders = {}
+
     binary_cols = [c for c, t in col_types.items()
-                   if t == "binary" and c in df.columns and c != target_col]
+                   if t == "binary" and c in feature_cols]
     for col in binary_cols:
-        unique_vals = df[col].dropna().unique()
+        unique_vals = train_df[col].dropna().unique()
         if set(map(str, unique_vals)) <= {"0", "1", "0.0", "1.0"}:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            encoders[col] = None  # already numeric
         else:
             le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
+            le.fit(train_df[col].astype(str))
             encoders[col] = le
 
-    # ── Label-encode multi-category columns
     cat_cols = [c for c, t in col_types.items()
-                if t == "categorical" and c in df.columns and c != target_col]
+                if t == "categorical" and c in feature_cols]
     for col in cat_cols:
         le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str))
+        le.fit(train_df[col].astype(str))
         encoders[col] = le
 
-    # ── Ensure all remaining object cols are encoded
-    remaining_obj = df.select_dtypes(include="object").columns.tolist()
-    remaining_obj = [c for c in remaining_obj if c != target_col]
+    # Any remaining object column is encoded too.
+    remaining_obj = [c for c in feature_cols
+                     if pd.api.types.is_object_dtype(train_df[c]) and c not in encoders]
     for col in remaining_obj:
         le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str))
+        le.fit(train_df[col].astype(str))
         encoders[col] = le
 
+    def _encode(frame: pd.DataFrame) -> pd.DataFrame:
+        frame = frame.copy()
+        for col, encoder in encoders.items():
+            if col not in frame.columns:
+                continue
+            if encoder is None:
+                frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
+            else:
+                known = set(encoder.classes_)
+                frame[col] = frame[col].astype(str).map(
+                    lambda x: int(encoder.transform([x])[0]) if x in known else 0
+                )
+        return frame
+
+    train_df = _encode(train_df)
+    test_df  = _encode(test_df)
+
     # ── Split X / y
-    X = df.drop(columns=[target_col])
-    y = pd.to_numeric(df[target_col], errors="coerce").fillna(0).astype(int)
-    feature_names = list(X.columns)
+    X_train = train_df.drop(columns=[target_col])
+    X_test  = test_df.drop(columns=[target_col])
+    y_train = pd.to_numeric(train_df[target_col], errors="coerce").fillna(0).astype(int)
+    y_test  = pd.to_numeric(test_df[target_col],  errors="coerce").fillna(0).astype(int)
+    feature_names = list(X_train.columns)
 
-    # ── Train / test split (stratified)
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
-
-    # ── Scale numeric columns
+    # ── Scale numeric columns (scaler fitted on train only)
     numeric_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
     scaler = StandardScaler()
     X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
     X_test[numeric_cols]  = scaler.transform(X_test[numeric_cols])
 
     return (X_train, X_test, y_train, y_test, scaler, encoders, col_types,
-            feature_names, numeric_cols)
+            feature_names, numeric_cols, date_refs, impute_values)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -278,8 +342,14 @@ def apply_smote_generic(X_train: pd.DataFrame, y_train: pd.Series):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_generic_models() -> dict:
-    """Return the production Random Forest and XGBoost benchmark."""
-    return {
+    """Return all candidate models for the generic pipeline."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.svm import SVC
+
+    models = {
+        "Logistic Regression": LogisticRegression(
+            max_iter=1000, random_state=42, class_weight="balanced",
+        ),
         "Random Forest": RandomForestClassifier(
             n_estimators=150, max_depth=10, random_state=42,
             n_jobs=-1, class_weight="balanced"
@@ -289,12 +359,26 @@ def get_generic_models() -> dict:
             eval_metric="logloss", random_state=42, n_jobs=-1,
             scale_pos_weight=3,
         ),
+        "SVM": SVC(
+            kernel="rbf", probability=True, random_state=42,
+            class_weight="balanced",
+        ),
     }
+    try:
+        from lightgbm import LGBMClassifier
+        models["LightGBM"] = LGBMClassifier(
+            n_estimators=150, max_depth=8, learning_rate=0.1,
+            random_state=42, n_jobs=-1, verbose=-1,
+            is_unbalance=True,
+        )
+    except ImportError:
+        pass
+    return models
 
 
 def train_generic_models(X_train, X_test, y_train, y_test) -> tuple:
     """
-    Train the two approved models. Random Forest is the production model.
+    Train both candidate models and keep the one with the best holdout ROC-AUC.
     """
     models  = get_generic_models()
     results = []
@@ -304,8 +388,9 @@ def train_generic_models(X_train, X_test, y_train, y_test) -> tuple:
         model.fit(X_train, y_train)
         trained[name] = model
 
-        y_pred  = model.predict(X_test)
         y_proba = model.predict_proba(X_test)[:, 1]
+        # Use the same decision threshold the app serves with.
+        y_pred  = (y_proba >= DECISION_THRESHOLD).astype(int)
 
         metrics = {
             "model":     name,
@@ -317,7 +402,8 @@ def train_generic_models(X_train, X_test, y_train, y_test) -> tuple:
         }
         results.append(metrics)
 
-    best_name = "Random Forest"
+    best_row  = max(results, key=lambda r: (r["roc_auc"], r["f1"]))
+    best_name = best_row["model"]
     best_model = trained[best_name]
 
     return best_model, trained, results, best_name
@@ -363,7 +449,8 @@ def run_generic_pipeline(df: pd.DataFrame, target_col: str,
         churn_rate, n_rows, n_features
     """
     # 1. Preprocess
-    X_train, X_test, y_train, y_test, scaler, encoders, col_types, feature_names, scaler_columns = \
+    (X_train, X_test, y_train, y_test, scaler, encoders, col_types,
+     feature_names, scaler_columns, date_refs, impute_values) = \
         preprocess_generic(df, target_col, id_col)
 
     n_rows     = len(df)
@@ -394,6 +481,8 @@ def run_generic_pipeline(df: pd.DataFrame, target_col: str,
         "col_types":             col_types,
         "feature_names":         feature_names,
         "scaler_columns":        scaler_columns,
+        "date_refs":             date_refs,
+        "impute_values":         impute_values,
         "churn_rate":            churn_rate,
         "n_rows":                n_rows,
         "n_features":            n_features,
@@ -406,32 +495,44 @@ def run_generic_pipeline(df: pd.DataFrame, target_col: str,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def predict_generic_batch(df_raw: pd.DataFrame, pipeline_result: dict,
-                           target_col: str, id_col: str = None) -> pd.DataFrame:
+                           target_col: str, id_col: str = None,
+                           model=None) -> pd.DataFrame:
     """
     Run predictions on the full uploaded dataset.
-    Returns df_raw with added columns: churn_probability, churn_prediction, risk_level.
+
+    Args:
+        df_raw:          Original uploaded frame.
+        pipeline_result: Dict returned by :func:`run_generic_pipeline`.
+        target_col:      Ground-truth column (kept in the output for evaluation).
+        id_col:          Customer identifier (unused except for documentation).
+        model:           Optional estimator override, e.g. one of
+                         ``pipeline_result["all_models"]`` to score with a
+                         non-default model.
+
+    Returns df_raw with added columns: churn_probability, churn_prediction,
+    risk_level plus the dashboard-facing ``Churn Probability`` /
+    ``Churn Prediction`` / ``Risk Level``.
     """
-    best_model   = pipeline_result["best_model"]
-    scaler       = pipeline_result["scaler"]
-    encoders     = pipeline_result["encoders"]
-    col_types    = pipeline_result["col_types"]
-    feature_names = pipeline_result["feature_names"]
+    best_model     = model if model is not None else pipeline_result["best_model"]
+    scaler         = pipeline_result["scaler"]
+    encoders       = pipeline_result["encoders"]
+    feature_names  = pipeline_result["feature_names"]
     scaler_columns = pipeline_result["scaler_columns"]
+    date_refs      = pipeline_result.get("date_refs", {})
+    impute_values  = pipeline_result.get("impute_values", {})
 
     df = df_raw.copy()
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    # ── Preprocess same way as training (without splitting)
-    # Drop target and ID
-    drop_cols = [c for c, t in col_types.items() if t == "drop"]
-    keep_cols = [c for c in feature_names if c in df.columns]
-
-    # Handle any columns added during date processing
+    # Handle any columns added during date processing. Reuse the reference date
+    # captured at training time so the same row always produces the same value.
     for col in list(df.columns):
         if col + "_days" in feature_names and col not in feature_names:
             try:
-                parsed = pd.to_datetime(df[col], infer_datetime_format=True, errors="coerce")
-                ref = parsed.min()
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                ref = date_refs.get(col)
+                if ref is None:
+                    continue
                 df[col + "_days"] = (parsed - ref).dt.days.fillna(0).astype(int)
             except Exception:
                 pass
@@ -444,25 +545,29 @@ def predict_generic_batch(df_raw: pd.DataFrame, pipeline_result: dict,
         else:
             X[col] = 0
 
-    # Replace any remaining infinite values in X with NaN
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    # Impute missing
+    # Impute with the *training* values, never the batch's own statistics.
     for col in X.columns:
+        fallback = impute_values.get(col, 0)
         if pd.api.types.is_numeric_dtype(X[col]) or col in scaler_columns:
-            X[col] = pd.to_numeric(X[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-            med = X[col].median()
-            X[col] = X[col].fillna(med if pd.notna(med) else 0)
+            X[col] = pd.to_numeric(X[col], errors="coerce").replace(
+                [np.inf, -np.inf], np.nan
+            ).fillna(fallback if not isinstance(fallback, str) else 0)
         else:
-            if X[col].isna().sum() > 0:
-                X[col] = X[col].fillna(0)
+            X[col] = X[col].fillna(fallback)
 
-    # Encode
+    # Encode with the encoders fitted on the training partition.
     for col, le in encoders.items():
-        if col in X.columns:
+        if col not in X.columns:
+            continue
+        if le is None:
+            X[col] = pd.to_numeric(X[col], errors="coerce").fillna(0).astype(int)
+        else:
             known_classes = set(le.classes_)
-            X[col] = X[col].apply(lambda v: le.transform([str(v)])[0]
-                                   if str(v) in known_classes else 0)
+            X[col] = X[col].apply(
+                lambda v: le.transform([str(v)])[0] if str(v) in known_classes else 0
+            )
 
     # Use exact column sequence fitted by StandardScaler
     X[scaler_columns] = scaler.transform(X[scaler_columns])
@@ -472,19 +577,14 @@ def predict_generic_batch(df_raw: pd.DataFrame, pipeline_result: dict,
 
     # Predict
     probas = best_model.predict_proba(X)[:, 1]
-    preds  = best_model.predict(X)
-
-    def risk_level(p):
-        if p >= 0.55:
-            return "🔴 High"
-        elif p >= 0.35:
-            return "🟡 Medium"
-        else:
-            return "🟢 Low"
+    preds  = (probas >= DECISION_THRESHOLD).astype(int)
 
     result_df = df_raw.copy()
     result_df["Churn Probability"]  = (probas * 100).round(1)
     result_df["Churn Prediction"]   = np.where(preds == 1, "Will Churn", "Will Stay")
-    result_df["Risk Level"]         = [risk_level(p) for p in probas]
+    result_df["Risk Level"]         = [classify_risk_emoji(p) for p in probas]
+    result_df["churn_probability"]  = probas.round(4)
+    result_df["churn_prediction"]   = preds
+    result_df["risk_level"]         = [classify_risk_emoji(p).split(" ", 1)[1] for p in probas]
 
     return result_df

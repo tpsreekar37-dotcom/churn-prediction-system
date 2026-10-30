@@ -1,9 +1,9 @@
 ========================================================================
-   BUSINESS ANALYTICS SYSTEM: AI-DRIVEN CUSTOMER CHURN PREDICTION
+   BUSINESS ANALYTICS SYSTEM: CUSTOMER CHURN PREDICTION
 ========================================================================
 
-STEP 1: Open Command Prompt / Terminal in this folder:
-        cd Customer_Churn_Prediction_System
+STEP 1: Open Command Prompt / Terminal in the project folder:
+        cd churn_predicting
 
 STEP 2: Install required Python dependencies:
         pip install -r requirements.txt
@@ -14,11 +14,31 @@ STEP 3: Run the Streamlit Dashboard:
 STEP 4: Open your web browser at:
         http://localhost:8501
 
-========================================================================
-REQUIREMENTS:
-- Python 3.9 or higher
-- Internet connection (for loading fonts & icons)
+------------------------------------------------------------------------
+OPTIONAL: rebuild models, figures and the analytics database
+------------------------------------------------------------------------
+        python main.py
+
+------------------------------------------------------------------------
+REQUIREMENTS
+------------------------------------------------------------------------
+- Python 3.10 - 3.12
+- Internet connection (for dashboard fonts and icons)
 - Libraries: streamlit, pandas, scikit-learn, xgboost, plotly, openpyxl
+
+------------------------------------------------------------------------
+GOOD TO KNOW
+------------------------------------------------------------------------
+- One decision threshold (0.50) is used everywhere, so a model's accuracy,
+  precision, recall, F1 and ROC-AUC are identical on every dashboard page
+  and in every session.
+- "Revenue at risk" uses the first money column it finds (MonthlyCharges,
+  charges, balance, amount, ltv, ...). Monthly columns are annualised;
+  stock columns such as a bank account balance are not. If no money column
+  exists the app shows N/A instead of inventing a figure.
+- Uploading a non-Telco dataset (for example a bank churn CSV) trains a
+  separate pipeline on that file; the numbers shown for it are that file's
+  own held-out results.
 
 For detailed documentation, read USER_MANUAL.md or README.md
 ========================================================================

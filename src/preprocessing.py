@@ -203,15 +203,19 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     num_df = df.select_dtypes(include=[np.number])
     for col in num_df.columns:
         if df[col].isna().sum() > 0:
-            df[col].fillna(df[col].median(), inplace=True)
+            # Assign the result back instead of using inplace=True on a slice,
+            # which is unreliable under pandas copy-on-write semantics.
+            df[col] = df[col].fillna(df[col].median())
             logger.info(f"  Imputed {col} with median")
 
     # ── 2.7  Fill remaining NaN for categorical cols with mode
     cat_df = df.select_dtypes(include=["object"])
     for col in cat_df.columns:
         if df[col].isna().sum() > 0:
-            df[col].fillna(df[col].mode()[0], inplace=True)
-            logger.info(f"  Imputed {col} with mode")
+            mode = df[col].mode()
+            if not mode.empty:
+                df[col] = df[col].fillna(mode.iloc[0])
+                logger.info(f"  Imputed {col} with mode")
 
     logger.info(f"Cleaning done: {original_shape} → {df.shape}")
     return df
@@ -221,21 +225,35 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
 # 3. OUTLIER HANDLING
 # ──────────────────────────────────────────────────────────────────────────────
 
-def handle_outliers(df: pd.DataFrame, cols: list = None) -> pd.DataFrame:
+def handle_outliers(df: pd.DataFrame, cols: list = None,
+                    bounds: dict = None) -> pd.DataFrame:
     """
-    Cap outliers using IQR method (Winsorisation) on specified numeric columns.
+    Winsorise numeric columns to the 1st/99th percentile.
+
+    ``bounds`` may be supplied to reuse clip limits learned on the training set,
+    which keeps inference consistent with training. When omitted, limits are
+    computed from ``df`` (use only for the training frame).
     """
     if cols is None:
         cols = ["MonthlyCharges", "TotalCharges"]
 
+    # Mutate the caller's dict in place so the limits learned here can be
+    # persisted (feature_config.json) and reused at inference. Copying the dict
+    # silently left the caller with an empty ``outlier_bounds`` and disabled
+    # winsorisation everywhere except the frame that computed it.
+    if bounds is None:
+        bounds = {}
     for col in cols:
         if col not in df.columns:
             continue
-        Q1 = df[col].quantile(0.01)
-        Q3 = df[col].quantile(0.99)
+        if col in bounds:
+            lo, hi = bounds[col]
+        else:
+            lo, hi = df[col].quantile(0.01), df[col].quantile(0.99)
+            bounds[col] = (float(lo), float(hi))
         before_min, before_max = df[col].min(), df[col].max()
-        df[col] = np.clip(df[col], Q1, Q3)
-        logger.info(f"Outlier cap [{col}]: [{before_min:.2f},{before_max:.2f}] → [{Q1:.2f},{Q3:.2f}]")
+        df[col] = np.clip(df[col], lo, hi)
+        logger.info(f"Outlier cap [{col}]: [{before_min:.2f},{before_max:.2f}] → [{lo:.2f},{hi:.2f}]")
 
     return df
 
@@ -258,17 +276,23 @@ ORDINAL_COLS_MAP = {
 }
 
 
-def encode_features(df: pd.DataFrame):
+def encode_features(df: pd.DataFrame, encoders: dict = None):
     """
     Encode categorical features:
     - Binary Yes/No columns → 0/1
     - Service columns (with 'No internet/phone service') → 0/1
     - Contract → ordinal
     - Remaining categoricals → label encoded
-    Returns: encoded DataFrame, fitted encoders dict
+
+    Pass ``encoders=None`` to fit on the training frame. Pass the encoders
+    returned from training to transform any other frame (test set, inference
+    batch); unseen categories map to 0 instead of raising.
+
+    Returns: encoded DataFrame, fitted/passed encoders dict
     """
     df = df.copy()
-    encoders = {}
+    fit = encoders is None
+    encoders = {} if encoders is None else dict(encoders)
 
     # ── Binary Yes/No
     binary_cols = [
@@ -297,10 +321,22 @@ def encode_features(df: pd.DataFrame):
     for col in remaining_cats:
         if col == "Churn":
             continue
-        le = LabelEncoder()
-        df[col] = le.fit_transform(df[col].astype(str))
-        encoders[col] = le
-        logger.info(f"Label-encoded '{col}' → {list(le.classes_)}")
+
+        if fit:
+            le = LabelEncoder()
+            df[col] = le.fit_transform(df[col].astype(str))
+            encoders[col] = le
+            logger.info(f"Label-encoded '{col}' → {list(le.classes_)}")
+        else:
+            le = encoders.get(col)
+            if le is None or not hasattr(le, "classes_"):
+                # Column never seen during training: fall back to a stable hash-free code.
+                df[col] = 0
+                continue
+            known = set(le.classes_)
+            df[col] = df[col].astype(str).map(
+                lambda x: int(le.transform([x])[0]) if x in known else 0
+            )
 
     return df, encoders
 
@@ -354,9 +390,15 @@ def split_data(df: pd.DataFrame, target: str = "Churn", test_size: float = 0.20)
 # 7. FULL PIPELINE
 # ──────────────────────────────────────────────────────────────────────────────
 
-def run_preprocessing_pipeline():
+def run_preprocessing_pipeline(test_size: float = 0.20, random_state: int = 42):
     """
     End-to-end preprocessing pipeline.
+
+    The train/test split happens *before* any fitted transformation so that
+    encoders, outlier bounds and feature-engineering constants are learned from
+    the training partition only. Fitting them on the full dataset leaks test
+    information into training.
+
     Returns X_train, X_test, y_train, y_test, scaler, encoders, processed_df
     """
     ensure_dirs()
@@ -365,27 +407,53 @@ def run_preprocessing_pipeline():
     logger.info(f"Raw data: {df.shape}")
 
     df = clean_data(df)
-    df = handle_outliers(df)
-    df, encoders = encode_features(df)
+
+    # ── Split first, transform second
+    train_idx, test_idx = train_test_split(
+        df.index, test_size=test_size, random_state=random_state,
+        stratify=df["Churn"],
+    )
+    logger.info(f"Train rows: {len(train_idx):,} | Test rows: {len(test_idx):,}")
+
+    train_df = df.loc[train_idx].copy()
+    test_df  = df.loc[test_idx].copy()
+
+    # Outlier bounds learned on train, reused on test and at inference
+    outlier_bounds = {}
+    train_df = handle_outliers(train_df, bounds=outlier_bounds)
+    test_df  = handle_outliers(test_df,  bounds=outlier_bounds)
+
+    # Encoders fit on train, applied to test
+    train_df, encoders = encode_features(train_df, encoders=None)
+    test_df, _         = encode_features(test_df,  encoders=encoders)
 
     # Feature-engineering constants are learned from the training population.
-    # Saving them prevents dashboard/API inference from using different rules.
     feature_config = {
-        "monthly_charge_threshold": float(df["MonthlyCharges"].quantile(0.75)),
-        "monthly_charge_min": float(df["MonthlyCharges"].min()),
-        "monthly_charge_max": float(df["MonthlyCharges"].max()),
-        "tenure_min": float(df["tenure"].min()),
-        "tenure_max": float(df["tenure"].max()),
+        "monthly_charge_threshold": float(train_df["MonthlyCharges"].quantile(0.75)),
+        "monthly_charge_min": float(train_df["MonthlyCharges"].min()),
+        "monthly_charge_max": float(train_df["MonthlyCharges"].max()),
+        "tenure_min": float(train_df["tenure"].min()),
+        "tenure_max": float(train_df["tenure"].max()),
+        "outlier_bounds": {k: [float(lo), float(hi)] for k, (lo, hi) in outlier_bounds.items()},
     }
     with open(os.path.join(MODELS_DIR, "feature_config.json"), "w", encoding="utf-8") as f:
         json.dump(feature_config, f, indent=2)
 
-    # Save processed (pre-split) dataset
+    # Recombine in original row order for EDA / feature engineering lookups
+    df_processed = pd.concat([train_df, test_df]).loc[df.index]
+
     processed_path = os.path.join(DATA_PROCESSED, "churn_processed.csv")
-    df.to_csv(processed_path, index=False)
+    df_processed.to_csv(processed_path, index=False)
     logger.info(f"Processed dataset saved → {processed_path}")
 
-    X_train, X_test, y_train, y_test = split_data(df)
+    X_train = train_df.drop(columns=["Churn"])
+    X_test  = test_df.drop(columns=["Churn"])
+    y_train = train_df["Churn"].astype(int)
+    y_test  = test_df["Churn"].astype(int)
+
+    logger.info(f"Train set: {X_train.shape} | Test set: {X_test.shape}")
+    logger.info(f"Churn rate – train: {y_train.mean():.2%} | test: {y_test.mean():.2%}")
+
     X_train, X_test, scaler = scale_features(X_train, X_test)
 
     # Persist the fitted transformations with the model.  Inference must use
@@ -395,13 +463,13 @@ def run_preprocessing_pipeline():
     logger.info("Saved preprocessing artifacts to models/")
 
     # Save train/test splits
-    train_df = X_train.copy(); train_df["Churn"] = y_train.values
-    test_df  = X_test.copy();  test_df["Churn"]  = y_test.values
-    train_df.to_csv(os.path.join(DATA_PROCESSED, "train.csv"), index=False)
-    test_df.to_csv(os.path.join(DATA_PROCESSED, "test.csv"),  index=False)
+    train_out = X_train.copy(); train_out["Churn"] = y_train.values
+    test_out  = X_test.copy();  test_out["Churn"]  = y_test.values
+    train_out.to_csv(os.path.join(DATA_PROCESSED, "train.csv"), index=False)
+    test_out.to_csv(os.path.join(DATA_PROCESSED, "test.csv"),  index=False)
     logger.info("Train/test CSVs saved to data/processed/")
 
-    return X_train, X_test, y_train, y_test, scaler, encoders, df
+    return X_train, X_test, y_train, y_test, scaler, encoders, df_processed
 
 
 if __name__ == "__main__":

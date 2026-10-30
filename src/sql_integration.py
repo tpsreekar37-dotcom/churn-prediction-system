@@ -22,7 +22,11 @@ import pandas as pd
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils import logger, BASE_DIR, ensure_dirs
+from src.utils import (
+    logger, BASE_DIR, ensure_dirs,
+    RISK_HIGH, RISK_MEDIUM, DECISION_THRESHOLD, classify_risk,
+    find_revenue_column,
+)
 
 DB_PATH = os.path.join(BASE_DIR, "data", "churn.db")
 
@@ -192,8 +196,13 @@ def store_predictions_to_sqlite(df_predicted: pd.DataFrame, run_id: str = None, 
     else:
         cust_ids = [f"CUST-{i+1:05d}" for i in range(len(df))]
 
-    # Numeric billing columns
+    # Numeric billing columns. Telco calls this MonthlyCharges; other datasets
+    # use balance/amount/estimated_salary. Persist whichever exists so the
+    # revenue-at-risk queries never silently sum a column of zeros.
     mc_s = get_series(["monthlycharges", "monthly_charges", "monthly", "charges"])
+    revenue_col, revenue_is_monthly, revenue_label = find_revenue_column(df)
+    if mc_s is None and revenue_col is not None:
+        mc_s = df[revenue_col]
     monthly_charges = [clean_float(v, 0.0) for v in mc_s] if mc_s is not None else [0.0] * len(df)
 
     t_s = get_series(["tenure", "months"])
@@ -202,6 +211,10 @@ def store_predictions_to_sqlite(df_predicted: pd.DataFrame, run_id: str = None, 
     tc_s = get_series(["totalcharges", "total_charges", "total"])
     if tc_s is not None:
         total_charges = [clean_float(v, monthly_charges[i] * tenures[i]) for i, v in enumerate(tc_s)]
+    elif revenue_col is not None and not revenue_is_monthly:
+        # The money column is a stock value (balance/salary), not a monthly rate,
+        # so multiplying by tenure would fabricate a lifetime figure.
+        total_charges = list(monthly_charges)
     else:
         total_charges = [monthly_charges[i] * tenures[i] for i in range(len(df))]
 
@@ -248,9 +261,9 @@ def store_predictions_to_sqlite(df_predicted: pd.DataFrame, run_id: str = None, 
             elif v_str in ["0", "no", "false", "retained", "stay", "0.0"]:
                 preds.append(0)
             else:
-                preds.append(1 if probs[i] >= 0.50 else 0)
+                preds.append(1 if probs[i] >= DECISION_THRESHOLD else 0)
     else:
-        preds = [1 if p >= 0.50 else 0 for p in probs]
+        preds = [1 if p >= DECISION_THRESHOLD else 0 for p in probs]
 
     risk_s = get_series(["risklevel", "risk_level", "riskcategory", "risk_category"])
     if risk_s is not None:
@@ -264,9 +277,9 @@ def store_predictions_to_sqlite(df_predicted: pd.DataFrame, run_id: str = None, 
             elif "low" in v_str:
                 risk_cats.append("Low")
             else:
-                risk_cats.append("High" if probs[i] >= 0.65 else ("Medium" if probs[i] >= 0.40 else "Low"))
+                risk_cats.append(classify_risk(probs[i]))
     else:
-        risk_cats = ["High" if p >= 0.65 else ("Medium" if p >= 0.40 else "Low") for p in probs]
+        risk_cats = [classify_risk(p) for p in probs]
 
     act_s = get_series(["churn", "actual_churn", "target", "actual"])
     if act_s is not None:
@@ -501,6 +514,11 @@ def run_analytics(db_path: str = DB_PATH, run_id: str = None) -> dict:
         """,
 
         "revenue_at_risk": f"""
+            -- ``customers.monthly_charges`` holds whichever revenue column the
+            -- uploaded dataset provides (MonthlyCharges, balance, amount, ...).
+            -- The *12 annualisation below is only meaningful when that column is
+            -- genuinely monthly, which is why the dashboard derives its revenue
+            -- figures from the scored frame via utils.get_revenue_metrics().
             SELECT
                 ROUND(SUM(CASE WHEN p.predicted_churn = 1 THEN c.monthly_charges ELSE 0 END), 2) AS monthly_revenue_at_risk,
                 ROUND(12.0 * SUM(CASE WHEN p.predicted_churn = 1 THEN c.monthly_charges ELSE 0 END), 2) AS annual_revenue_at_risk,

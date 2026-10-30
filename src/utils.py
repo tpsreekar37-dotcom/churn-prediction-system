@@ -68,6 +68,61 @@ PALETTE = {
 
 CHURN_COLORS = [PALETTE["positive"], PALETTE["negative"]]
 
+# ──────────────────────────────────────────────────────────────────────────────
+# RISK BANDING
+# ──────────────────────────────────────────────────────────────────────────────
+# Single source of truth. Every module (predict, generic pipeline, SQL, dashboard)
+# must use these thresholds so the same probability never maps to two labels.
+RISK_HIGH = 0.65
+RISK_MEDIUM = 0.40
+
+# Decision threshold applied to model probabilities. The production model is
+# trained on SMOTE-balanced data, so 0.50 over-predicts churn on real traffic.
+DECISION_THRESHOLD = 0.50
+
+
+def classify_risk(probability: float) -> str:
+    """Map a churn probability (0-1) to a single canonical risk label."""
+    p = safe_float(probability, 0.0)
+    if p >= RISK_HIGH:
+        return "High"
+    if p >= RISK_MEDIUM:
+        return "Medium"
+    return "Low"
+
+
+def classify_risk_emoji(probability: float) -> str:
+    """Same banding as classify_risk, rendered with the dashboard's status dots."""
+    return {"High": "🔴 High", "Medium": "🟡 Medium", "Low": "🟢 Low"}[
+        classify_risk(probability)
+    ]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MODEL SCHEMA GUARD
+# ──────────────────────────────────────────────────────────────────────────────
+# The production model was trained on IBM Telco columns. Scoring an upload that
+# lacks these columns would silently fill every feature with 0 and return an
+# identical probability for every row, so callers must check compatibility first.
+TELCO_REQUIRED_COLUMNS = [
+    "tenure",
+    "MonthlyCharges",
+    "TotalCharges",
+    "Contract",
+    "InternetService",
+    "PaymentMethod",
+]
+
+
+def is_telco_schema(df: pd.DataFrame) -> bool:
+    """Return True only if df contains the columns the production model expects."""
+    if df is None or not hasattr(df, "columns"):
+        return False
+    normalised = {str(c).strip().lower().replace("_", "") for c in df.columns}
+    return all(
+        col.lower().replace("_", "") in normalised for col in TELCO_REQUIRED_COLUMNS
+    )
+
 def set_style() -> None:
     """Apply Alabaster Sovereign design system style to matplotlib."""
     plt.rcParams.update({
@@ -121,50 +176,152 @@ def safe_int(v, default=0) -> int:
         return default
 
 
-def find_col(df: pd.DataFrame, candidates: list, default=None):
-    """Find the first matching column name in df from a list of candidates."""
+def find_col(df: pd.DataFrame, candidates: list, default=None, exact: bool = False):
+    """
+    Find the first matching column name in df from a list of candidates.
+
+    By default matching is loose (substring, punctuation-insensitive) which is
+    useful for messy uploads. Pass ``exact=True`` for safety-critical lookups
+    where a substring hit would be wrong (e.g. resolving a customer ID column).
+    """
     if df is None or not hasattr(df, "columns"):
         return default
     for c in df.columns:
         c_clean = str(c).strip().lower().replace("_", "").replace(" ", "")
         for cand in candidates:
             cand_clean = cand.lower().replace("_", "").replace(" ", "")
-            if c_clean == cand_clean or cand_clean in c_clean:
+            if c_clean == cand_clean or (not exact and cand_clean in c_clean):
                 return c
     return default
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# REVENUE / VALUE-AT-RISK HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+# Datasets use wildly different names for the money column. Telco has
+# ``MonthlyCharges``; a bank dataset has ``balance`` and ``estimated_salary``;
+# others use ``amount`` / ``ltv``. If we cannot find one we must say so instead of
+# silently reporting $0 of exposure.
+REVENUE_COLUMN_CANDIDATES = [
+    # (normalised name, is_monthly, human label)
+    ("monthlycharges",    True,  "Monthly Charges"),
+    ("monthlycharge",     True,  "Monthly Charges"),
+    ("mrr",               True,  "Monthly Recurring Revenue"),
+    ("charges",           True,  "Charges"),
+    ("charge",            True,  "Charges"),
+    ("balance",           False, "Account Balance"),
+    ("accountbalance",    False, "Account Balance"),
+    ("estimatedsalary",   False, "Estimated Salary"),
+    ("salary",            False, "Salary"),
+    ("annualincome",      False, "Annual Income"),
+    ("income",            False, "Income"),
+    ("amount",            False, "Amount"),
+    ("revenue",           False, "Revenue"),
+    ("ltv",               False, "Lifetime Value"),
+    ("clv",               False, "Customer Lifetime Value"),
+    ("customervalue",     False, "Customer Value"),
+]
+
+
+def find_revenue_column(df: pd.DataFrame):
+    """
+    Locate the monetary column that best represents value at risk.
+
+    Returns ``(column, is_monthly, label)`` or ``(None, False, None)`` when the
+    frame has no usable money column.
+
+    Exact (punctuation-insensitive) matches are preferred so ``TotalCharges``
+    never wins over ``MonthlyCharges``. ``balance`` is matched before the looser
+    ``amount``/``value`` substring rules for the same reason.
+    """
+    if df is None or not hasattr(df, "columns") or len(df.columns) == 0:
+        return None, False, None
+
+    normalised = {str(c).strip().lower().replace("_", "").replace(" ", ""): c for c in df.columns}
+
+    for cand, is_monthly, label in REVENUE_COLUMN_CANDIDATES:
+        if cand in normalised:
+            col = normalised[cand]
+            # Guard against all-zero / all-null columns (e.g. an empty balance field)
+            numeric = pd.to_numeric(df[col], errors="coerce")
+            if numeric.notna().any() and numeric.abs().sum() > 0:
+                return col, is_monthly, label
+
+    # Loose fallback: a column whose name merely *contains* a money keyword.
+    for cand, is_monthly, label in REVENUE_COLUMN_CANDIDATES:
+        for norm_name, col in normalised.items():
+            if cand in norm_name and "total" not in norm_name:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                if numeric.notna().any() and numeric.abs().sum() > 0:
+                    return col, is_monthly, label
+
+    return None, False, None
+
+
 def get_revenue_metrics(predicted: pd.DataFrame, sql_results: dict = None) -> dict:
-    """Calculate executive MRR, ARR, ARPU, and capital exposure metrics."""
-    if sql_results and "revenue_at_risk" in sql_results and not sql_results["revenue_at_risk"].empty:
-        r = sql_results["revenue_at_risk"].iloc[0]
-        return {
-            "mrr": safe_float(r.get("monthly_revenue_at_risk"), 0.0),
-            "arr": safe_float(r.get("annual_revenue_at_risk"), 0.0),
-            "arpu": safe_float(r.get("arpu"), 0.0),
-            "churner_arpu": safe_float(r.get("churner_arpu"), 0.0),
-            "high_val": safe_int(r.get("high_value_churn_count"), 0),
-            "total": safe_int(r.get("total_customers"), len(predicted) if predicted is not None else 0),
-        }
-    if predicted is None or predicted.empty:
-        return {"mrr": 0.0, "arr": 0.0, "arpu": 0.0, "churner_arpu": 0.0, "high_val": 0, "total": 0}
-    monthly_col = find_col(predicted, ["monthlycharges", "monthly_charges", "monthly", "charges"])
-    if monthly_col is None:
-        predicted = predicted.copy()
-        predicted["_mc"] = 70.0
-        monthly_col = "_mc"
-    else:
-        predicted[monthly_col] = pd.to_numeric(predicted[monthly_col], errors="coerce").fillna(0)
-    churned = predicted[predicted["Churn Prediction"] == "Will Churn"]
-    high_risk = predicted[predicted["Risk Level"].astype(str).str.contains("High", case=False, na=False)]
-    mrr = float(churned[monthly_col].sum())
-    return {
-        "mrr": mrr, "arr": mrr * 12.0,
-        "arpu": float(predicted[monthly_col].mean() if len(predicted) > 0 else 0.0),
-        "churner_arpu": float(churned[monthly_col].mean() if len(churned) > 0 else 0.0),
-        "high_val": len(high_risk),
-        "total": len(predicted),
+    """
+    Calculate value-at-risk, annualised exposure, ARPU and high-value churners.
+
+    The numbers are derived from the scored DataFrame itself (which still holds
+    the original money column) rather than from SQL aggregates. That guarantees
+    the figure on screen matches the dataset that was just scored and avoids the
+    old failure mode where a missing ``MonthlyCharges`` column was stored as 0
+    and every page displayed a confident ``$0``.
+
+    Returned keys:
+        at_risk        value held by predicted churners (one period)
+        annual         annualised exposure (x12 only when the column is monthly)
+        mrr / arr      aliases kept for backwards compatibility
+        arpu           mean value across all customers
+        churner_arpu   mean value across predicted churners
+        high_val       count of high-risk customers
+        total          rows scored
+        available      False when no monetary column exists → render "N/A"
+        label          human name of the money column
+        is_monthly     whether the column is a monthly figure
+    """
+    empty = {
+        "at_risk": 0.0, "annual": 0.0, "mrr": 0.0, "arr": 0.0,
+        "arpu": 0.0, "churner_arpu": 0.0,
+        "high_val": 0, "total": 0,
+        "available": False, "label": None, "is_monthly": False,
     }
+    if predicted is None or predicted.empty:
+        return empty
+
+    predicted = predicted.copy()
+    total = len(predicted)
+
+    churn_mask = (
+        predicted["Churn Prediction"].astype(str).str.strip().str.lower() == "will churn"
+        if "Churn Prediction" in predicted.columns
+        else pd.Series(False, index=predicted.index)
+    )
+    risk_col = "Risk Level" if "Risk Level" in predicted.columns else "risk_level"
+    high_mask = (
+        predicted[risk_col].astype(str).str.contains("High", case=False, na=False)
+        if risk_col in predicted.columns
+        else pd.Series(False, index=predicted.index)
+    )
+
+    col, is_monthly, label = find_revenue_column(predicted)
+    if col is None:
+        return {**empty, "total": total, "high_val": int(high_mask.sum())}
+
+    values = pd.to_numeric(predicted[col], errors="coerce").fillna(0.0)
+    at_risk = float(values[churn_mask].sum())
+    annual = at_risk * 12.0 if is_monthly else at_risk
+    arpu = float(values.mean()) if total else 0.0
+    churner_arpu = float(values[churn_mask].mean()) if churn_mask.any() else 0.0
+
+    return {
+        "at_risk": at_risk, "annual": annual,
+        "mrr": at_risk, "arr": annual,
+        "arpu": arpu, "churner_arpu": churner_arpu,
+        "high_val": int(high_mask.sum()), "total": total,
+        "available": True, "label": label, "is_monthly": is_monthly,
+    }
+
 
 
 def print_separator(title: str = "") -> None:

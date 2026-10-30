@@ -110,7 +110,7 @@ def plot_tenure_analysis(df: pd.DataFrame) -> str:
     data_churn    = df[df["Churn"] == 1]["tenure"]
     bp = axes[1].boxplot(
         [data_no_churn, data_churn],
-        tick_labels=["No Churn", "Churn"],
+        labels=["No Churn", "Churn"],
         patch_artist=True, medianprops=dict(color="white", lw=2),
         boxprops=dict(linewidth=1.5)
     )

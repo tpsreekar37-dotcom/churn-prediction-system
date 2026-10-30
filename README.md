@@ -1,136 +1,230 @@
-# AI-Driven Customer Churn Prediction System
+# Business Analytics System: AI-Driven Customer Churn Prediction
 
-> **A production-grade, end-to-end Machine Learning System** designed to predict customer churn, quantify financial revenue exposure (MRR/ARR at risk), execute real-time model training & convergence analysis, and prescribe data-driven retention playbooks.
+An end-to-end machine learning system that predicts customer churn, quantifies
+revenue exposure from whichever monetary column the dataset provides, and
+simulates retention campaign ROI.
 
-![Python](https://img.shields.io/badge/Python-3.9%20%7C%203.10%20%7C%203.11-blue?logo=python)
-![Scikit-Learn](https://img.shields.io/badge/Scikit--Learn-1.3.2-orange?logo=scikitlearn)
-![XGBoost](https://img.shields.io/badge/XGBoost-2.0.3-green)
+> **Accuracy of claims:** this project contains no LLM/AI-generated narrative
+> feature. All insights are computed from the trained classifier and SQL
+> aggregates. Earlier revisions of this README advertised a Gemini integration
+> that was never shipped.
+
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)
+![Scikit-Learn](https://img.shields.io/badge/Scikit--Learn-1.3-orange?logo=scikitlearn)
+![XGBoost](https://img.shields.io/badge/XGBoost-2.0-green)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.29-red?logo=streamlit)
-![License](https://img.shields.io/badge/License-MIT-purple)
 
 ---
 
-## 📌 Business Overview & Capabilities
+## Business Overview
 
-In subscription businesses, **acquiring a new customer costs 5–7× more than retaining an existing one**. Customer churn directly degrades Monthly Recurring Revenue (MRR) and Enterprise Valuation. This system combines predictive machine learning with financial telemetry and prescriptive strategy.
+In subscription and telecom businesses, acquiring a new customer costs 5–7×
+more than retaining an existing one. Customer churn directly erodes recurring
+revenue and enterprise valuation.
 
-### 5 Interactive Dashboard Modules:
-1. **Executive Overview**: High-level portfolio KPIs, churn probability distribution (binned into 10% tiers), contract distribution, and payment method risk diagnostics.
-2. **Upload Dataset & Predict Churn**: Universal ML inference supporting any uploaded CSV or Excel file (`.csv`, `.xlsx`). Auto-detects feature types, scores records in milliseconds, and outputs risk categories (High / Medium / Low).
-3. **Business Revenue & Financial Risk**: SQL-driven financial telemetry computing Monthly Revenue at Risk (MRR), Annualized Recurring Revenue (ARR), ARPU differences, and an interactive **Retention Campaign ROI Simulator**.
-4. **Model Testing & Evaluation**: Live epoch-by-epoch neural network training simulation with real loss and accuracy convergence tracking, interactive epoch count selector (1–100), and confusion matrix display.
-5. **Customer Retention Strategy**: Dynamic diagnostics pairing diagnosed customer portfolio problems (contract traps, payment friction, onboarding gaps) with root cause analyses, strategic solutions, SLAs, and capital impact projections.
+### Capabilities
+
+1. **Batch Dataset Upload & Prediction Engine**
+   - Upload a CSV or Excel customer dataset.
+   - Automatic target and feature column detection.
+   - Per-customer churn probability and risk tier (High / Medium / Low).
+   - 10% binned churn probability distribution chart.
+
+2. **Business Revenue & Risk Telemetry**
+   - **Value at risk** is computed from the scored rows using the first monetary
+     column found, in this priority order: `MonthlyCharges` / `mrr` / `charges`
+     (monthly), then `balance` / `amount` / `ltv` / `revenue` / `salary` /
+     `income` (one-off or stock values).
+   - Monthly columns get an **annualised exposure** figure (`× 12`). Stock
+     columns such as a bank `balance` are **not** multiplied and are labelled
+     with their own name ("Account Balance at Risk"), never "MRR".
+   - If no monetary column exists, every revenue tile shows **N/A** instead of a
+     fabricated `$0` or a hard-coded per-customer guess.
+   - ARPU comparison between predicted churners and the whole portfolio.
+   - **Retention Campaign ROI Simulator**: adjust intervention success rate and
+     incentive cost to project value preserved, cost, net gain and ROI.
+
+3. **SQL Analytics Subsystem**
+   - SQLite schema for customers, contracts and prediction runs.
+   - Run-isolated history via `run_id`, so re-scoring never mixes cohorts.
+   - Parameterised queries for churn by contract, payment method, tenure cohort
+     and revenue at risk.
+
+4. **Model Evaluation**
+   - Logistic Regression, Random Forest, XGBoost, SVM, LightGBM and a voting
+     ensemble, compared on the same held-out split.
+   - ROC curves, confusion matrix and feature importance.
+   - **One canonical metrics table** (`src/model_registry.py`) feeds every page,
+     so accuracy / precision / recall / F1 / ROC-AUC for a given model are the
+     same numbers everywhere in the app and across sessions.
+   - Real iterative training telemetry (an MLP trained epoch-by-epoch with
+     `warm_start`), not a simulated curve.
 
 ---
 
-## 🤖 Model Performance & Evaluation
+## Quick Start
 
-Two primary models were benchmarked on the benchmark IBM Telco dataset (7,043 customer accounts):
-
-| Model | Accuracy | Precision | Recall | F1 Score | AUC-ROC | Status |
-|---|---|---|---|---|---|---|
-| **Random Forest Classifier** | **76.8%** | **54.8%** | **70.4%** | **61.7%** | **0.8362** | **Production Champion ★** |
-| **XGBoost Classifier** | **74.2%** | **50.8%** | **78.8%** | **61.8%** | **0.8212** | Benchmark Baseline |
-
-- **Top Predictors**: RiskScore (engineered), ChargesPerTenure, Contract type, MonthlyCharges, and tenure length.
-- **Production Selection**: Random Forest delivers higher AUC-ROC (0.8362) and better probability calibration for churn risk tiering.
-
----
-
-## 🚀 Quick Start (Local Setup)
-
-### 1. Clone the repository
-```bash
-git clone https://github.com/tpsreekar37-dotcom/churn-prediction-system.git
-cd churn-prediction-system
-```
-
-### 2. Create and activate a virtual environment
-```bash
-# Windows
-python -m venv venv
-venv\Scripts\activate
-
-# macOS / Linux
-python3 -m venv venv
-source venv/bin/activate
-```
-
-### 3. Install dependencies
-```bash
+```cmd
+cd churn_predicting
 pip install -r requirements.txt
-```
-
-### 4. Run the Streamlit Dashboard
-```bash
 streamlit run dashboard/app.py
 ```
-Open **`http://localhost:8501`** in your browser.
+
+Open **http://localhost:8501**.
+
+To regenerate every artefact from raw data (preprocessing, features, EDA,
+training, figures, SQL load):
+
+```cmd
+python main.py
+```
 
 ---
 
-## ☁️ Deployment on Render (Free Tier)
+## Deploy (GitHub → Railway)
 
-This repository includes `render.yaml` and `Procfile` preconfigured for Render's free Web Service runtime:
+The repo is deploy-ready: `Procfile`, `.python-version` (3.12) and
+`.streamlit/config.toml` are included, and the trained models in `models/` are
+committed on purpose — the app loads them at startup instead of retraining.
 
-1. Sign in to [Render](https://render.com/).
-2. Click **New +** → **Web Service**.
-3. Connect your GitHub repository (`churn-prediction-system`).
-4. Configure service settings:
-   - **Environment**: `Python`
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `streamlit run dashboard/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
-   - **Instance Type**: `Free`
-5. Click **Create Web Service**. Render will automatically build the environment and host the live application.
+```cmd
+git init
+git add .
+git commit -m "Churn prediction dashboard"
+git branch -M main
+git remote add origin https://github.com/<you>/<repo>.git
+git push -u origin main
+```
+
+Then on Railway: **New Project → Deploy from GitHub repo →** pick the repo.
+Railway installs `requirements.txt` and runs the `Procfile` command; no env
+vars and no build command are required. Generate a public domain under
+**Settings → Networking**.
+
+Notes:
+
+- `.streamlit/secrets.toml` is **not** committed. If you later add a key, put it
+  in Railway's *Variables* tab instead (`GEMINI_API_KEY=...`).
+- `data/churn.db` is not committed; the app creates it on first write. Railway's
+  filesystem is ephemeral, so prediction history resets on each redeploy.
+- `models/best_model.pkl` is ~80 MB. It is under GitHub's 100 MB per-file limit,
+  but the first push uploads ~107 MB of model artefacts.
+- Full step-by-step (including the plain-Docker fallback) is in `DEPLOY.md`.
 
 ---
 
-## 📁 Repository Structure
+## Project Structure
 
 ```
-churn-prediction-system/
-├── app.py                      # Root entry point forwarding to dashboard
-├── Procfile                    # Web service process configuration
-├── render.yaml                 # Render Blueprint automated specification
-├── .python-version             # Python version definition (3.10.13)
-├── requirements.txt            # Production dependencies
-├── teseataset.xlsx             # Demo test dataset for immediate upload testing
-│
-├── dashboard/
-│   ├── app.py                  # Streamlit Enterprise Application (5 pages)
-│   └── style.css               # Styling definitions
-│
-├── src/
-│   ├── predict.py              # ML batch & single inference engine
-│   ├── generic_pipeline.py     # Universal dataset preprocessor
-│   ├── sql_integration.py      # SQLite database analytics engine
-│   ├── train_model.py          # Random Forest & XGBoost model trainers
-│   ├── preprocessing.py        # Data cleaning and feature scaling
-│   ├── feature_engineering.py  # Feature engineering definitions
-│   └── utils.py                # Core constants & path helpers
-│
-├── models/
-│   ├── best_model.pkl          # Trained Random Forest model (production)
-│   ├── xgboost.pkl             # Trained XGBoost model
-│   ├── scaler.pkl              # Fitted MinMaxScaler
-│   ├── encoders.pkl            # Categorical encoders
-│   └── model_results.json      # Benchmark performance metrics
+churn_predicting/
 │
 ├── data/
-│   ├── churn.db                # SQLite database with benchmark runs
-│   ├── raw/                    # Raw Telco benchmark CSV
-│   └── processed/              # Processed datasets
+│   ├── raw/                    ← Raw IBM Telco dataset
+│   ├── processed/              ← Cleaned train/test splits
+│   └── churn.db                ← SQLite analytics store (generated)
 │
-└── tests/
-    └── verify_all.py           # Verification and end-to-end test suite
+├── dashboard/
+│   └── app.py                  ← Streamlit dashboard
+│
+├── src/
+│   ├── preprocessing.py        ← Cleaning, split, encoding, scaling
+│   ├── feature_engineering.py  ← Derived features + SMOTE
+│   ├── train_model.py          ← Model training & evaluation
+│   ├── predict.py              ← Inference engine
+│   ├── generic_pipeline.py     ← Schema-agnostic pipeline for uploads
+│   ├── model_registry.py       ← Canonical metric table + model selection
+│   ├── sql_integration.py      ← SQLite persistence & analytics
+│   ├── eda.py                  ← Exploratory figures
+│   └── utils.py                ← Shared constants, risk bands, helpers
+│
+├── models/                     ← Trained artefacts (generated)
+│   ├── best_model.pkl
+│   ├── model_metadata.json     ← Runtime/library versions + metrics
+│   ├── scaler.pkl / encoders.pkl
+│   └── feature_config.json     ← Thresholds learned from the training split
+│
+├── reports/figures/            ← EDA and evaluation charts
+├── tests/                      ← pytest suite
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## 🛡️ Security & Privacy Notice
-This repository contains no hardcoded credentials, secret keys, or sensitive personally identifiable customer data. All customer records in sample datasets use synthetic, anonymized identifiers.
+## Testing with an upload
+
+1. Launch the dashboard.
+2. Open **Dataset Import & Model Selection**.
+3. Upload a Telco-schema CSV, any other CSV with a churn column (for example
+   `C:\Users\tpvij\Desktop\bank_dataset\Bank Customer Churn Prediction.csv`),
+   or click **Load Benchmark**.
+4. Pick a model (or leave **Auto (Best)**) and click **Apply & Score Portfolio**.
+5. Review risk scores, the probability distribution and the results table;
+   download the scored CSV.
+
+The dashboard routes automatically:
+
+| Upload contains | Scoring path |
+|---|---|
+| `tenure`, `MonthlyCharges`, `TotalCharges`, `Contract`, `InternetService`, `PaymentMethod` | Pre-trained Telco models |
+| Any other schema with a binary churn column | `generic_pipeline` trains and evaluates its own candidate models on the upload |
+| Neither | Explicit error message — no placeholder predictions |
+
+For a non-Telco upload the per-model metrics shown in the app are that upload's
+own held-out split results. For the benchmark Telco dataset they are the saved
+values in `models/model_results.json`. In both cases the same table is reused on
+every page, so a model never shows two different accuracies.
 
 ---
 
-## 📄 License
-Released under the [MIT License](LICENSE).
+## Model & Metrics
+
+### Decision threshold
+
+A single threshold — `DECISION_THRESHOLD = 0.50` in `src/utils.py` — turns a
+probability into "Will Churn" / "Will Stay". Training-time evaluation, batch
+scoring, single-customer scoring and the dashboards all use it, so the same
+probability always produces the same label.
+
+The Youden-J optimal threshold found during training is stored as
+`youden_threshold_informational` in `models/model_metadata.json`. It is
+**informational only** and is deliberately not used for scoring: mixing the two
+was what produced the old "81.9% here, 73% there" discrepancy.
+
+### One canonical metrics table
+
+`src/model_registry.py` exposes `metric_rows()` and `canonical_metric_rows()`.
+Every page calls one of them:
+
+| Page | Source |
+|---|---|
+| Dataset Import & Model Selection | canonical rows |
+| Model Comparison & Evaluation | canonical rows (one pipeline trained per upload, each candidate model scored separately) |
+| Model Testing & Evaluation | canonical rows for the benchmark cards |
+| Model Testing & Evaluation → Live Ground-Truth | live re-score, explicitly captioned with the canonical figure and the delta |
+
+The holdout metrics are written to `models/model_results.json` after each
+training run; `models/model_metadata.json` records the library versions that
+produced the artifacts. Do not compare metrics across runs without checking
+that file first — a scikit-learn version change can move results.
+
+Known limitations:
+
+- The 0.50 threshold favours recall, so the model over-predicts churn relative to
+  the base rate. Risk bands are advisory.
+- Probabilities are calibrated with `CalibratedClassifierCV` when that does not
+  cost more than 0.005 ROC-AUC; otherwise the uncalibrated model is kept and
+  `calibrated` is `false` in the metadata.
+- The Telco model must not be used on non-Telco data; the schema guard prevents
+  this, but it means "universal" scoring always retrains on the upload.
+- No drift monitoring, and no scheduled retraining.
+- Quantile winsorisation bounds are learned on the training split and stored in
+  `models/feature_config.json`. Inference clips to those bounds, so an absurd
+  input (e.g. a `MonthlyCharges` of 1,000,000) scores exactly like the largest
+  value the model ever saw.
+
+---
+
+## License
+
+MIT License — built for professional enterprise demonstration.

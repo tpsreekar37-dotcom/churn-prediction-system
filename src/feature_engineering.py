@@ -22,9 +22,14 @@ from src.utils import logger
 # 1. FEATURE ENGINEERING
 # ──────────────────────────────────────────────────────────────────────────────
 
-def create_features(df: pd.DataFrame) -> pd.DataFrame:
+def create_features(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
     """
     Derive new predictive features from existing ones.
+
+    ``config`` supplies thresholds learned on the training partition. When it is
+    omitted the statistics are recomputed from ``df`` — do that only for
+    exploratory analysis, never for model training, or test rows leak into the
+    feature definitions.
 
     New features:
     - ChargesPerTenure      : Monthly charges / (tenure + 1)
@@ -34,6 +39,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     - RiskScore             : Composite churn risk score
     """
     df = df.copy()
+    config = config or {}
 
     # Feature 1: Charges per month of tenure
     if "MonthlyCharges" in df.columns and "tenure" in df.columns:
@@ -50,7 +56,9 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # Feature 3: High-value customer flag (top 25% monthly charges)
     if "MonthlyCharges" in df.columns:
-        threshold = df["MonthlyCharges"].quantile(0.75)
+        threshold = config.get("monthly_charge_threshold")
+        if threshold is None:
+            threshold = df["MonthlyCharges"].quantile(0.75)
         df["IsHighValue"] = (df["MonthlyCharges"] >= threshold).astype(int)
 
     # Feature 4: Loyalty flag (> 2 years tenure)
@@ -58,12 +66,17 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
         df["HasLoyalty"] = (df["tenure"] > 24).astype(int)
 
     # Feature 5: Composite risk score
-    if "Contract" in df.columns and "MonthlyCharges" in df.columns:
+    if "Contract" in df.columns and "MonthlyCharges" in df.columns and "tenure" in df.columns:
+        charge_min = config.get("monthly_charge_min", df["MonthlyCharges"].min())
+        charge_max = config.get("monthly_charge_max", df["MonthlyCharges"].max())
+        tenure_min = config.get("tenure_min", df["tenure"].min())
+        tenure_max = config.get("tenure_max", df["tenure"].max())
+
         contract_risk = (2 - df["Contract"]) / 2
-        charges_norm  = (df["MonthlyCharges"] - df["MonthlyCharges"].min()) / (
-                         df["MonthlyCharges"].max() - df["MonthlyCharges"].min() + 1e-9)
-        tenure_norm   = 1 - (df["tenure"] - df["tenure"].min()) / (
-                             df["tenure"].max()  - df["tenure"].min()  + 1e-9)
+        charges_norm  = (df["MonthlyCharges"] - charge_min) / (
+                         charge_max - charge_min + 1e-9)
+        tenure_norm   = 1 - (df["tenure"] - tenure_min) / (
+                             tenure_max - tenure_min + 1e-9)
         df["RiskScore"] = (0.4 * contract_risk + 0.3 * charges_norm + 0.3 * tenure_norm).round(4)
 
     new_cols = [c for c in ["ChargesPerTenure", "ServiceCount", "IsHighValue",
@@ -101,12 +114,24 @@ def apply_smote(X_train: pd.DataFrame, y_train: pd.Series,
 
 def run_feature_engineering(df: pd.DataFrame, X_train: pd.DataFrame,
                              X_test: pd.DataFrame, y_train: pd.Series,
-                             y_test: pd.Series):
+                             y_test: pd.Series, config: dict = None):
     """
     Engineer features and balance training set with SMOTE.
     Returns: X_train_bal, X_test_fe, y_train_bal, y_test
     """
-    df_fe = create_features(df)
+    # Derive thresholds from the training rows only, so test rows cannot
+    # influence IsHighValue / RiskScore definitions.
+    if config is None:
+        train_slice = df.loc[X_train.index]
+        config = {
+            "monthly_charge_threshold": float(train_slice["MonthlyCharges"].quantile(0.75)),
+            "monthly_charge_min": float(train_slice["MonthlyCharges"].min()),
+            "monthly_charge_max": float(train_slice["MonthlyCharges"].max()),
+            "tenure_min": float(train_slice["tenure"].min()),
+            "tenure_max": float(train_slice["tenure"].max()),
+        }
+
+    df_fe = create_features(df, config=config)
 
     new_feat_cols = [
         c for c in ["ChargesPerTenure", "ServiceCount", "IsHighValue",
@@ -123,12 +148,14 @@ def run_feature_engineering(df: pd.DataFrame, X_train: pd.DataFrame,
 
     X_train_bal, y_train_bal = apply_smote(X_train_fe, y_train)
 
-    return X_train_bal, X_test_fe, y_train_bal, y_test
+    # Also return the un-resampled engineered training frame so callers can run
+    # honest cross-validation without synthetic rows.
+    return X_train_bal, X_test_fe, y_train_bal, y_test, X_train_fe
 
 
 if __name__ == "__main__":
     from src.preprocessing import run_preprocessing_pipeline
     X_tr, X_te, y_tr, y_te, scaler, encoders, df = run_preprocessing_pipeline()
-    X_tr_b, X_te_fe, y_tr_b, y_te = run_feature_engineering(df, X_tr, X_te, y_tr, y_te)
+    X_tr_b, X_te_fe, y_tr_b, y_te, X_tr_raw = run_feature_engineering(df, X_tr, X_te, y_tr, y_te)
     print(f"Balanced training set: {X_tr_b.shape}")
     print(f"Features: {list(X_tr_b.columns)}")

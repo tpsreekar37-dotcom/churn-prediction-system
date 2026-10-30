@@ -16,7 +16,11 @@ import numpy as np
 import joblib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.utils import logger, MODELS_DIR
+from src.utils import (
+    logger, MODELS_DIR,
+    RISK_HIGH, RISK_MEDIUM, DECISION_THRESHOLD,
+    classify_risk, classify_risk_emoji, is_telco_schema,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -37,7 +41,31 @@ def load_model(model_name: str = "best_model"):
             )
         _model_cache[model_name] = joblib.load(path)
         logger.info(f"Loaded model: {path}")
+        _warn_if_version_mismatch()
     return _model_cache[model_name]
+
+
+def _warn_if_version_mismatch() -> None:
+    """
+    Compare the installed scikit-learn version against the one recorded when the
+    artifact was trained. Unpickling across versions can silently change results.
+    """
+    meta_path = os.path.join(MODELS_DIR, "model_metadata.json")
+    if not os.path.exists(meta_path):
+        return
+    try:
+        import sklearn
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        trained_with = str(meta.get("sklearn_version", ""))
+        if trained_with and trained_with != sklearn.__version__:
+            logger.warning(
+                "Model was trained with scikit-learn %s but %s is installed. "
+                "Retrain with 'python main.py' to guarantee identical results.",
+                trained_with, sklearn.__version__,
+            )
+    except Exception:
+        pass
 
 
 def get_best_model_name() -> str:
@@ -71,6 +99,19 @@ def load_preprocessing_artifacts():
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. PREPROCESSING FOR INFERENCE
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _clip_to_training_bounds(df: pd.DataFrame, config: dict) -> pd.DataFrame:
+    """
+    Winsorise numeric columns using the limits learned during training.
+
+    Training caps MonthlyCharges/TotalCharges at the 1st/99th percentile; without
+    this the model sees out-of-distribution values at inference.
+    """
+    for col, pair in (config.get("outlier_bounds") or {}).items():
+        if col in df.columns and len(pair) == 2:
+            df[col] = np.clip(df[col], float(pair[0]), float(pair[1]))
+    return df
+
 
 # Mapping tables mirroring preprocessing.py
 BINARY_MAP = {"Yes": 1, "No": 0}
@@ -136,6 +177,9 @@ def preprocess_single(customer: dict) -> pd.DataFrame:
 
     df = pd.DataFrame([row])
 
+    # ── Match the training-time winsorisation
+    df = _clip_to_training_bounds(df, config)
+
     # ── Feature engineering (mirroring feature_engineering.py)
     df["TotalCharges"]    = df.get("TotalCharges", df["MonthlyCharges"] * df["tenure"])
     df["ChargesPerTenure"] = df["MonthlyCharges"] / (df["tenure"] + 1)
@@ -188,29 +232,36 @@ def predict_single(customer: dict, model=None) -> dict:
 
     df = preprocess_single(customer)
 
+    # Strip non-feature columns
+    _drop = [c for c in df.columns if c.lower() in
+             {"churn", "customerid", "customer_id", "custid", "accountid"}]
+    if _drop:
+        df = df.drop(columns=_drop, errors="ignore")
+
     # Align with model's expected feature order
+    expected_cols = None
     if hasattr(model, "feature_names_in_"):
         expected_cols = list(model.feature_names_in_)
+    elif hasattr(model, "estimators_") and model.estimators_:
+        for _est in model.estimators_:
+            if hasattr(_est, "feature_names_in_"):
+                expected_cols = list(_est.feature_names_in_)
+                break
+
+    if expected_cols is not None:
         for col in expected_cols:
             if col not in df.columns:
                 df[col] = 0
         df = df[expected_cols]
 
     prob = float(model.predict_proba(df)[0, 1])
-    pred = int(model.predict(df)[0])
-
-    if prob >= 0.65:
-        risk = "High"
-    elif prob >= 0.40:
-        risk = "Medium"
-    else:
-        risk = "Low"
+    pred = int(prob >= DECISION_THRESHOLD)
 
     return {
         "churn_prediction":  pred,
         "churn_probability": round(prob, 4),
         "churn_label":       "Churn" if pred == 1 else "No Churn",
-        "risk_level":        risk,
+        "risk_level":        classify_risk(prob),
     }
 
 
@@ -259,6 +310,9 @@ def preprocess_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
         else:
             df[col] = 0.0
 
+    # Match the training-time winsorisation before deriving features
+    df = _clip_to_training_bounds(df, config)
+
     # Feature engineering
     total_derived = df["MonthlyCharges"] * df["tenure"]
     df["TotalCharges"] = np.where(df["TotalCharges"] > 0, df["TotalCharges"], total_derived)
@@ -284,7 +338,7 @@ def preprocess_dataframe(df_raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def predict_batch(df_raw: pd.DataFrame, model=None) -> pd.DataFrame:
+def predict_batch(df_raw: pd.DataFrame, model=None, require_schema: bool = True) -> pd.DataFrame:
     """
     Predict churn for a batch of customers from a raw DataFrame.
     Returns standardized columns:
@@ -295,48 +349,69 @@ def predict_batch(df_raw: pd.DataFrame, model=None) -> pd.DataFrame:
       - 'churn_probability' (0.0 to 1.0)
       - 'churn_prediction'  (0 or 1)
       - 'risk_level'         ('High' / 'Medium' / 'Low')
+
+    Raises ValueError when ``require_schema`` is True and the frame is missing
+    the Telco columns this model was trained on. Scoring an incompatible schema
+    would fill every feature with 0 and return identical probabilities for all
+    rows, so callers must route non-Telco data to the generic pipeline instead.
     """
+    if require_schema and not is_telco_schema(df_raw):
+        raise ValueError(
+            "Dataset does not match the Telco churn model schema. "
+            "Missing one or more of: tenure, MonthlyCharges, TotalCharges, "
+            "Contract, InternetService, PaymentMethod. "
+            "Use src.generic_pipeline for arbitrary schemas."
+        )
+
     if model is None:
         model = load_model("best_model")
 
     try:
         X = preprocess_dataframe(df_raw)
+
+        # ── Drop known non-feature columns that preprocess_dataframe passes through
+        _drop = [c for c in X.columns if c.lower() in
+                 {"churn", "customerid", "customer_id", "custid", "accountid",
+                  "churn prediction", "churn_prediction", "churn probability",
+                  "churn_probability", "risk level", "risk_level"}]
+        if _drop:
+            X = X.drop(columns=_drop, errors="ignore")
+
+        # ── Align columns to what the model expects
+        expected = None
         if hasattr(model, "feature_names_in_"):
             expected = list(model.feature_names_in_)
+        elif hasattr(model, "estimators_") and model.estimators_:
+            # VotingClassifier: grab feature names from first sub-estimator
+            for _est in model.estimators_:
+                if hasattr(_est, "feature_names_in_"):
+                    expected = list(_est.feature_names_in_)
+                    break
+
+        if expected is not None:
             for c in expected:
                 if c not in X.columns:
                     X[c] = 0
             X = X[expected]
+
         probs = model.predict_proba(X)[:, 1]
-        preds = model.predict(X)
+        # Apply the app-wide decision threshold instead of the estimator's
+        # implicit 0.50 so batch, single and evaluation paths agree.
+        preds = (probs >= DECISION_THRESHOLD).astype(int)
     except Exception as e:
         logger.warning(f"Vectorized batch prediction fallback: {e}")
         results = [predict_single(r.to_dict(), model) for _, r in df_raw.iterrows()]
         probs = np.array([r["churn_probability"] for r in results])
         preds = np.array([r["churn_prediction"] for r in results])
 
-    def to_risk_emoji(p):
-        if p >= 0.65:
-            return "🔴 High"
-        elif p >= 0.40:
-            return "🟡 Medium"
-        return "🟢 Low"
-
-    def to_risk_plain(p):
-        if p >= 0.65:
-            return "High"
-        elif p >= 0.40:
-            return "Medium"
-        return "Low"
-
     out = df_raw.copy()
     out["Churn Probability"] = (probs * 100).round(1)
     out["Churn Prediction"]  = np.where(preds == 1, "Will Churn", "Will Stay")
-    out["Risk Level"]        = [to_risk_emoji(p) for p in probs]
+    out["Risk Level"]        = [classify_risk_emoji(p) for p in probs]
 
     out["churn_probability"] = probs.round(4)
     out["churn_prediction"]  = preds.astype(int)
-    out["risk_level"]        = [to_risk_plain(p) for p in probs]
+    out["risk_level"]        = [classify_risk(p) for p in probs]
     return out
 
 

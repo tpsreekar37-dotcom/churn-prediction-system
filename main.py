@@ -51,14 +51,14 @@ def main():
     X_train, X_test, y_train, y_test, scaler, encoders, df_processed = \
         run_preprocessing_pipeline()
 
-    # Also keep the pre-encoded raw df for EDA
+    # EDA works on the raw, cleaned frame (pre-encoding / pre-scaling).
     df_raw = load_data()
     df_raw = clean_data(df_raw)
     df_raw = handle_outliers(df_raw)
 
     # ── STEP 2: Feature Engineering
     print_separator("STEP 2: Feature Engineering & SMOTE")
-    X_train_bal, X_test_fe, y_train_bal, y_test = run_feature_engineering(
+    X_train_bal, X_test_fe, y_train_bal, y_test, X_train_unbalanced = run_feature_engineering(
         df_processed, X_train, X_test, y_train, y_test
     )
 
@@ -70,13 +70,17 @@ def main():
     # ── STEP 4: Model Training & Evaluation
     print_separator("STEP 4: Model Training & Evaluation")
     best_model, results, best_name = run_training_pipeline(
-        X_train_bal, X_test_fe, y_train_bal, y_test
+        X_train_bal, X_test_fe, y_train_bal, y_test,
+        cv_X=X_train_unbalanced, cv_y=y_train
     )
 
     # ── STEP 5: SQL Database & Analytics
     print_separator("STEP 5: SQL Database & Analytics")
     from src.predict import predict_batch
-    df_scored = predict_batch(df_processed, best_model)
+    # Score the RAW frame. ``df_processed`` is already encoded and scaled, so
+    # feeding it back through the inference preprocessor double-transformed
+    # every feature and corrupted the demo rows stored in SQLite.
+    df_scored = predict_batch(df_raw, best_model)
     sql_results = run_sql_pipeline(df_scored)
 
     # ── SUMMARY
