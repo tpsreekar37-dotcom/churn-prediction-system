@@ -121,10 +121,11 @@ churn_predicting/
 ├── data/
 │   ├── raw/                    ← Raw IBM Telco dataset
 │   ├── processed/              ← Cleaned train/test splits
-│   └── churn.db                ← SQLite analytics store (generated)
+│   └── churn.db                ← SQLite analytics store (generated, not committed)
 │
 ├── dashboard/
-│   └── app.py                  ← Streamlit dashboard
+│   ├── app.py                  ← Streamlit dashboard (all six pages)
+│   └── style.css               ← Theme
 │
 ├── src/
 │   ├── preprocessing.py        ← Cleaning, split, encoding, scaling
@@ -137,15 +138,21 @@ churn_predicting/
 │   ├── eda.py                  ← Exploratory figures
 │   └── utils.py                ← Shared constants, risk bands, helpers
 │
-├── models/                     ← Trained artefacts (generated)
-│   ├── best_model.pkl
+├── models/                     ← Trained artefacts (committed — the app loads them at startup)
+│   ├── best_model.pkl          ← Calibrated best model
 │   ├── model_metadata.json     ← Runtime/library versions + metrics
+│   ├── model_results.json      ← Canonical per-model holdout metrics
 │   ├── scaler.pkl / encoders.pkl
-│   └── feature_config.json     ← Thresholds learned from the training split
+│   └── feature_config.json     ← Thresholds and outlier bounds from the training split
 │
 ├── reports/figures/            ← EDA and evaluation charts
+├── slide_exports/              ← Presentation slide images
+├── sql/                        ← Reference analytics queries
+├── scripts/legacy/             ← One-off report/deck generators (not used at runtime)
 ├── tests/                      ← pytest suite
+├── Procfile / .python-version  ← Deploy entry point and runtime pin
 ├── requirements.txt
+├── DEPLOY.md                   ← GitHub → Railway guide
 └── README.md
 ```
 
@@ -155,9 +162,9 @@ churn_predicting/
 
 1. Launch the dashboard.
 2. Open **Dataset Import & Model Selection**.
-3. Upload a Telco-schema CSV, any other CSV with a churn column (for example
-   `C:\Users\tpvij\Desktop\bank_dataset\Bank Customer Churn Prediction.csv`),
-   or click **Load Benchmark**.
+3. Upload a Telco-schema CSV, any other CSV with a churn column (for example a
+   bank churn file with `balance` and `churn` columns), or click
+   **Load Benchmark**.
 4. Pick a model (or leave **Auto (Best)**) and click **Apply & Score Portfolio**.
 5. Review risk scores, the probability distribution and the results table;
    download the scored CSV.
